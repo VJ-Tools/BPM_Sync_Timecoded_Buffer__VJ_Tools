@@ -493,7 +493,7 @@ if _HAS_SCOPE:
             json_schema_extra=ui_field_config(
                 order=1,
                 label="Latency Buffer (ms)",
-                category="input",
+                is_load_param=False,
             ),
         )
 
@@ -504,7 +504,7 @@ if _HAS_SCOPE:
             json_schema_extra=ui_field_config(
                 order=2,
                 label="Beat Buffer Depth",
-                category="input",
+                is_load_param=False,
             ),
         )
 
@@ -513,7 +513,7 @@ if _HAS_SCOPE:
             json_schema_extra=ui_field_config(
                 order=3,
                 label="HOLD (freeze playback)",
-                category="input",
+                is_load_param=False,
             ),
         )
 
@@ -522,7 +522,7 @@ if _HAS_SCOPE:
             json_schema_extra=ui_field_config(
                 order=4,
                 label="Reset Buffer",
-                category="input",
+                is_load_param=False,
             ),
         )
 
