@@ -157,13 +157,16 @@ def test_test_pattern_input():
 
 def test_set_bpm():
     """Test manual BPM setting."""
-    from bpm_sync_timecoded_buffer.pipeline import BpmTimecodedBufferPipeline, BpmBufferConfig
+    from bpm_sync_timecoded_buffer.pipeline import BpmTimecodedBufferPipeline, BpmBufferConfig, ClockSource
 
     config = BpmBufferConfig()
     pipeline = BpmTimecodedBufferPipeline(config)
 
+    # Switch to internal clock so set_bpm has immediate effect
+    pipeline._clock.set_source(ClockSource.INTERNAL, bpm=120.0)
     pipeline.set_bpm(140.0)
-    assert pipeline._clock._tempo == 140.0, f"Expected 140 BPM, got {pipeline._clock._tempo}"
+    assert pipeline._clock._internal_bpm == 140.0, f"Expected 140 BPM, got {pipeline._clock._internal_bpm}"
+    assert pipeline._clock.tempo == 140.0, f"Expected tempo 140, got {pipeline._clock.tempo}"
 
     print("  [OK] Set BPM test passed")
 
@@ -252,6 +255,49 @@ def test_postprocessor_decode():
     print(f"  [OK] Postprocessor decode test passed (success={meta['decode_success']}, fail={meta['decode_fail']})")
 
 
+def test_clock_source_switching():
+    """Test switching between clock sources."""
+    from bpm_sync_timecoded_buffer.pipeline import ClockManager, ClockSource
+
+    clock = ClockManager(120.0)
+
+    # Default is internal
+    clock.set_source(ClockSource.INTERNAL, bpm=130.0)
+    assert clock.source == ClockSource.INTERNAL
+    assert clock.tempo == 130.0
+
+    # Switch BPM
+    clock.set_internal_bpm(145.0)
+    assert clock.tempo == 145.0
+
+    # Source info should contain source type
+    info = clock.source_info
+    assert info["source"] == "internal"
+    assert info["tempo"] == 145.0
+
+    clock.stop()
+    print("  [OK] Clock source switching test passed")
+
+
+def test_preprocessor_clock_source():
+    """Test that preprocessor respects clock_source parameter."""
+    from bpm_sync_timecoded_buffer.pipeline import BpmTimecodedBufferPipeline, BpmBufferConfig
+
+    config = BpmBufferConfig()
+    pipeline = BpmTimecodedBufferPipeline(config)
+
+    frame = make_test_frame()
+    # Switch to internal clock via kwargs
+    result = pipeline(video=[frame], clock_source="internal", clock_bpm=140.0)
+
+    assert "video" in result
+    meta = result["_bpm_buffer_meta"]
+    assert meta["source"] == "internal"
+
+    pipeline._clock.stop()
+    print("  [OK] Preprocessor clock source test passed")
+
+
 def test_postprocessor_latency_mode():
     """Test latency buffer mode."""
     from bpm_sync_timecoded_buffer.pipeline import BpmTimecodeStripPipeline, BpmStripConfig
@@ -284,6 +330,8 @@ if __name__ == "__main__":
         test_test_pattern_input,
         test_set_bpm,
         test_barcode_roundtrip,
+        test_clock_source_switching,
+        test_preprocessor_clock_source,
         test_postprocessor_strip,
         test_postprocessor_decode,
         test_postprocessor_latency_mode,

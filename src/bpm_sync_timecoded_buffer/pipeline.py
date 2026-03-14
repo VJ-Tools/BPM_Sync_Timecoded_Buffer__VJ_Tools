@@ -2,7 +2,7 @@
 BPM Timecoded Buffer — Beat-Grid Timecoding Pipeline for Daydream Scope
 
 Preprocessor that:
-1. Joins an Ableton Link session for a shared beat clock
+1. Joins an Ableton Link session OR listens for MIDI clock for a shared beat clock
 2. Stamps a VJSync barcode on each input frame (encoding current beat position)
 3. Creates a VACE inpainting mask that preserves the barcode through AI generation
 
@@ -10,8 +10,12 @@ The barcode survives AI processing via VACE masking (mask=0 = preserve).
 The client decodes the surviving barcode on the output to know exactly which
 beat produced each frame — regardless of variable Scope inference latency.
 
+Clock sources:
+  - Ableton Link: Networked beat sync with DAWs and other Link-enabled apps
+  - MIDI Clock: Standard MIDI timing (24 PPQN) from DJ software, drum machines, etc.
+  - Free-running: Internal clock at configured BPM (fallback when no external sync)
+
 VACE integration follows Scope's dual-stream encoding:
-  - vace_input_frames: [1, 3, F, H, W] in [-1, 1] — full stamped frames
   - vace_input_masks:  [1, 1, F, H, W] binary — 1=inpaint, 0=preserve
   Scope internally splits: inactive = frame*(1-mask), reactive = frame*mask
 
@@ -43,6 +47,7 @@ from .vjsync_codec import (
     read_barcode,
 )
 from .test_source import TestPatternSource
+from .midi_clock import MidiClock
 
 # --- Scope imports: match actual Scope package structure ---
 try:
@@ -78,6 +83,15 @@ except ImportError:
         return kwargs.get("default")
 
 logger = logging.getLogger(__name__)
+
+
+# --- Clock Source Enum ---
+
+class ClockSource(str, Enum):
+    LINK = "link"          # Ableton Link (networked beat sync)
+    MIDI_CLOCK = "midi_clock"  # MIDI clock (24 PPQN from external device)
+    OSC = "osc"            # OSC-driven clock (BPM + beat pushed via /scope/osc_beat)
+    INTERNAL = "internal"  # Free-running internal clock
 
 
 # --- Ableton Link wrapper (runs in background thread) ---
@@ -211,6 +225,150 @@ class BufferMode(str, Enum):
     BEAT = "beat"            # Beat-delayed: smooth full-framerate playback, N beats behind
 
 
+# --- Unified Clock Manager ---
+
+class ClockManager:
+    """
+    Manages multiple clock sources (Link, MIDI Clock, OSC, Internal) and provides
+    a unified beat/tempo/phase interface. Only one source active at a time.
+
+    OSC mode: beat and BPM are pushed from external software via Scope's OSC
+    parameter mapping. External app sends:
+      /scope/osc_beat <float>    — current beat position (continuously updated)
+      /scope/clock_bpm <float>   — current BPM
+    The pipeline reads these from kwargs on each __call__.
+    """
+
+    def __init__(self, initial_bpm: float = 120.0):
+        self._source = ClockSource.INTERNAL
+        self._link_clock: Optional[LinkClock] = None
+        self._midi_clock: Optional[MidiClock] = None
+        self._internal_bpm = initial_bpm
+        self._internal_beat = 0.0
+        self._internal_start = time.monotonic()
+        self._midi_device = ""
+        # OSC-driven state (updated from kwargs each frame)
+        self._osc_beat: float = 0.0
+        self._osc_bpm: float = initial_bpm
+
+    def set_source(self, source: ClockSource, bpm: float = 120.0, midi_device: str = ""):
+        """Switch clock source. Stops previous source, starts new one."""
+        if source == self._source and midi_device == self._midi_device:
+            # Same source — just update BPM for internal/OSC
+            if source == ClockSource.INTERNAL:
+                self._internal_bpm = bpm
+            elif source == ClockSource.OSC:
+                self._osc_bpm = bpm
+            return
+
+        # Stop current source
+        self._stop_current()
+
+        self._source = source
+        self._midi_device = midi_device
+
+        if source == ClockSource.LINK:
+            self._link_clock = LinkClock(bpm)
+            self._link_clock.start(bpm)
+            logger.info(f"[Clock] Switched to Ableton Link at {bpm} BPM")
+
+        elif source == ClockSource.MIDI_CLOCK:
+            self._midi_clock = MidiClock()
+            self._midi_clock.start(device_name=midi_device)
+            logger.info(f"[Clock] Switched to MIDI Clock on '{midi_device or 'default'}'")
+
+        elif source == ClockSource.OSC:
+            self._osc_bpm = bpm
+            self._osc_beat = 0.0
+            logger.info(f"[Clock] Switched to OSC clock (send /scope/osc_beat and /scope/clock_bpm)")
+
+        else:  # ClockSource.INTERNAL
+            self._internal_bpm = bpm
+            self._internal_start = time.monotonic()
+            self._internal_beat = 0.0
+            logger.info(f"[Clock] Switched to Internal clock at {bpm} BPM")
+
+    def update_osc(self, beat: float, bpm: float):
+        """Update OSC-driven beat and BPM (called from pipeline __call__ each frame)."""
+        self._osc_beat = beat
+        if bpm > 0:
+            self._osc_bpm = bpm
+
+    def _stop_current(self):
+        """Stop the currently active clock source."""
+        if self._link_clock is not None:
+            self._link_clock.stop()
+            self._link_clock = None
+        if self._midi_clock is not None:
+            self._midi_clock.stop()
+            self._midi_clock = None
+
+    def stop(self):
+        """Stop all clock sources."""
+        self._stop_current()
+
+    def set_internal_bpm(self, bpm: float):
+        """Update internal clock BPM."""
+        self._internal_bpm = max(20.0, min(999.0, bpm))
+
+    @property
+    def beat(self) -> float:
+        if self._source == ClockSource.LINK and self._link_clock:
+            return self._link_clock.beat
+        elif self._source == ClockSource.MIDI_CLOCK and self._midi_clock:
+            return self._midi_clock.beat
+        elif self._source == ClockSource.OSC:
+            return self._osc_beat
+        else:
+            # Internal free-running
+            elapsed = time.monotonic() - self._internal_start
+            return elapsed * (self._internal_bpm / 60.0)
+
+    @property
+    def tempo(self) -> float:
+        if self._source == ClockSource.LINK and self._link_clock:
+            return self._link_clock.tempo
+        elif self._source == ClockSource.MIDI_CLOCK and self._midi_clock:
+            t = self._midi_clock.tempo
+            return t if t > 0 else self._internal_bpm  # Fallback if no clock received yet
+        elif self._source == ClockSource.OSC:
+            return self._osc_bpm
+        else:
+            return self._internal_bpm
+
+    @property
+    def phase(self) -> float:
+        return self.beat % 4.0
+
+    @property
+    def enabled(self) -> bool:
+        if self._source == ClockSource.LINK and self._link_clock:
+            return self._link_clock.enabled
+        elif self._source == ClockSource.MIDI_CLOCK and self._midi_clock:
+            return self._midi_clock.enabled
+        return True  # Internal is always enabled
+
+    @property
+    def source(self) -> ClockSource:
+        return self._source
+
+    @property
+    def source_info(self) -> dict:
+        """Return diagnostic info about the current clock source."""
+        info = {"source": self._source.value, "beat": self.beat, "tempo": self.tempo}
+        if self._source == ClockSource.LINK and self._link_clock:
+            info["link_peers"] = self._link_clock.num_peers
+            info["link_enabled"] = self._link_clock.enabled
+        elif self._source == ClockSource.MIDI_CLOCK and self._midi_clock:
+            info["midi_device"] = self._midi_clock.device_name
+            info["midi_running"] = self._midi_clock.running
+            info["midi_enabled"] = self._midi_clock.enabled
+        elif self._source == ClockSource.OSC:
+            info["osc_beat"] = self._osc_beat
+            info["osc_bpm"] = self._osc_bpm
+        return info
+
+
 # --- Config ---
 
 if _HAS_SCOPE:
@@ -221,9 +379,10 @@ if _HAS_SCOPE:
         pipeline_id = "bpm_sync_timecoded_buffer__vj_tools"
         pipeline_name = "BPM Sync Timecoded Buffer (VJ.Tools)"
         pipeline_description = (
-            "Beat-grid timecoding via Ableton Link. Stamps VJSync barcode on "
-            "input, preserves through AI via VACE masking (mask=0 at barcode). "
-            "Client decodes surviving barcode on output for beat-accurate timing."
+            "Beat-grid timecoding via Ableton Link or MIDI Clock. Stamps VJSync "
+            "barcode on input, preserves through AI via VACE masking (mask=0 at "
+            "barcode). Client decodes surviving barcode on output for beat-accurate "
+            "timing."
         )
         supports_prompts = False
         modified = True
@@ -235,12 +394,51 @@ if _HAS_SCOPE:
 
         # --- Runtime parameters ---
 
+        clock_source: ClockSource = Field(
+            default=ClockSource.LINK,
+            json_schema_extra=ui_field_config(
+                order=0,
+                label="Clock Source",
+                is_load_param=False,
+            ),
+        )
+
+        clock_bpm: float = Field(
+            default=120.0,
+            ge=20.0,
+            le=999.0,
+            json_schema_extra=ui_field_config(
+                order=1,
+                label="Clock BPM (Link/Internal)",
+                is_load_param=False,
+            ),
+        )
+
+        midi_device: str = Field(
+            default="",
+            json_schema_extra=ui_field_config(
+                order=2,
+                label="MIDI Clock Device",
+                is_load_param=False,
+            ),
+        )
+
+        osc_beat: float = Field(
+            default=0.0,
+            ge=0.0,
+            json_schema_extra=ui_field_config(
+                order=3,
+                label="OSC Beat Position",
+                category="input",
+            ),
+        )
+
         barcode_height: int = Field(
             default=16,
             ge=4,
             le=128,
             json_schema_extra=ui_field_config(
-                order=0,
+                order=4,
                 label="Barcode Height (px)",
                 is_load_param=False,
             ),
@@ -251,7 +449,7 @@ if _HAS_SCOPE:
             ge=0,
             le=16,
             json_schema_extra=ui_field_config(
-                order=1,
+                order=5,
                 label="Mask Feather (px)",
                 is_load_param=False,
             ),
@@ -260,7 +458,7 @@ if _HAS_SCOPE:
         test_input: bool = Field(
             default=False,
             json_schema_extra=ui_field_config(
-                order=2,
+                order=6,
                 label="Test Pattern Input",
                 is_load_param=False,
             ),
@@ -271,6 +469,10 @@ else:
         def __init__(self, **kwargs):
             self.pipeline_id = kwargs.get("pipeline_id", "bpm_timecoded_buffer")
             self.pipeline_name = kwargs.get("pipeline_name", "BPM Sync Timecoded Buffer (VJ.Tools)")
+            self.clock_source = kwargs.get("clock_source", "link")
+            self.clock_bpm = kwargs.get("clock_bpm", 120.0)
+            self.midi_device = kwargs.get("midi_device", "")
+            self.osc_beat = kwargs.get("osc_beat", 0.0)
             self.barcode_height = kwargs.get("barcode_height", 16)
             self.mask_feather = kwargs.get("mask_feather", 2)
             self.test_input = kwargs.get("test_input", False)
@@ -281,16 +483,18 @@ else:
 class BpmTimecodedBufferPipeline(Pipeline):
     """
     Scope preprocessor that stamps beat-grid timecodes using Ableton Link
-    and creates VACE masks to preserve them through AI generation.
+    or MIDI Clock and creates VACE masks to preserve them through AI generation.
 
-    Automatically joins an Ableton Link session on startup. The barcode is
-    stamped on input, the VACE mask ensures AI generates everything EXCEPT
-    the barcode strip (mask=0 = preserve), and the client decodes the
+    Clock sources:
+      - Ableton Link: Networked beat sync (default)
+      - MIDI Clock: 24 PPQN from DJ software, drum machines, hardware sequencers
+      - Internal: Free-running at configured BPM (fallback)
+
+    The barcode is stamped on input, the VACE mask ensures AI generates everything
+    EXCEPT the barcode strip (mask=0 = preserve), and the client decodes the
     surviving barcode on the output for beat-accurate timing.
 
     VACE mask format (matching Scope's VaceEncodingBlock):
-      - vace_input_frames [1,3,F,H,W] [-1,1]: full frames with barcode
-        Scope splits internally: inactive = frame*(1-mask), reactive = frame*mask
       - vace_input_masks [1,1,F,H,W] binary: 1=generate, 0=preserve
     """
 
@@ -315,16 +519,20 @@ class BpmTimecodedBufferPipeline(Pipeline):
         self.dtype = dtype if self.device.type == "cuda" else torch.float32
         self._frame_seq = 0
 
-        # Always start Ableton Link — BPM comes from the Link session
-        self._clock = LinkClock(120.0)
-        self._clock.start(120.0)
+        # Initialize clock manager with configured source
+        initial_bpm = getattr(config, "clock_bpm", 120.0)
+        self._clock = ClockManager(initial_bpm)
+
+        source = ClockSource(getattr(config, "clock_source", "link"))
+        midi_device = getattr(config, "midi_device", "")
+        self._clock.set_source(source, bpm=initial_bpm, midi_device=midi_device)
 
         # Test pattern source (lazy-initialized on first use)
         self._test_source: Optional[TestPatternSource] = None
 
         logger.info(
             f"[BPM Buffer] Pipeline initialized "
-            f"(device={self.device}, Link started at 120 BPM)"
+            f"(device={self.device}, clock={source.value})"
         )
 
     def __del__(self):
@@ -334,7 +542,7 @@ class BpmTimecodedBufferPipeline(Pipeline):
     def set_bpm(self, bpm: float):
         """Manually set BPM (for RunPod / no-Link scenarios)."""
         bpm = max(20.0, min(999.0, bpm))
-        self._clock._tempo = bpm
+        self._clock.set_internal_bpm(bpm)
         if self._test_source:
             self._test_source.set_bpm(bpm)
         logger.info(f"[BPM Buffer] Manual BPM: {bpm:.1f}")
@@ -350,12 +558,34 @@ class BpmTimecodedBufferPipeline(Pipeline):
         Scope passes video as kwargs["video"] — a list of (1, H, W, C) uint8 tensors.
 
         Returns:
-            dict with video, vace_input_frames, vace_input_masks
+            dict with video, vace_input_masks
         """
         video = kwargs.get("video", [])
         barcode_h = kwargs.get("barcode_height", getattr(self.config, "barcode_height", 16))
         mask_feather = kwargs.get("mask_feather", getattr(self.config, "mask_feather", 2))
         test_input = kwargs.get("test_input", getattr(self.config, "test_input", False))
+
+        # --- Clock source switching (runtime parameter updates) ---
+        clock_source_str = kwargs.get("clock_source", getattr(self.config, "clock_source", "link"))
+        clock_bpm = kwargs.get("clock_bpm", getattr(self.config, "clock_bpm", 120.0))
+        midi_device = kwargs.get("midi_device", getattr(self.config, "midi_device", ""))
+
+        # Convert string to enum safely
+        try:
+            target_source = ClockSource(str(clock_source_str))
+        except ValueError:
+            target_source = ClockSource.LINK
+
+        # Switch clock source if changed
+        if target_source != self._clock.source:
+            self._clock.set_source(target_source, bpm=clock_bpm, midi_device=midi_device)
+        elif target_source == ClockSource.INTERNAL:
+            self._clock.set_internal_bpm(clock_bpm)
+
+        # Update OSC clock from parameters (pushed via /scope/osc_beat and /scope/clock_bpm)
+        if target_source == ClockSource.OSC:
+            osc_beat = kwargs.get("osc_beat", getattr(self.config, "osc_beat", 0.0))
+            self._clock.update_osc(beat=osc_beat, bpm=clock_bpm)
 
         # Handle both list and tensor input, or empty
         if isinstance(video, list) and len(video) == 0:
@@ -376,7 +606,7 @@ class BpmTimecodedBufferPipeline(Pipeline):
         F, H, W, C = frames.shape
         barcode_h = min(barcode_h, H // 4)
 
-        # --- 1. Stamp barcode on each frame using Link beat clock ---
+        # --- 1. Stamp barcode on each frame using beat clock ---
         frames_np = frames.cpu().numpy().astype(np.uint8)
 
         for f_idx in range(F):
@@ -421,34 +651,18 @@ class BpmTimecodedBufferPipeline(Pipeline):
         # before routing video from the queue. If we include vace_input_frames,
         # it blocks the video input for non-VACE pipelines (like passthrough),
         # causing "Input cannot be None" errors.
-        #
-        # By only providing the mask, Scope will:
-        # - Route our stamped video through the queue to the main pipeline
-        # - If VACE is enabled, auto-route the video as vace_input_frames
-        # - Apply our custom mask (barcode=0=preserve, content=1=generate)
         vace_mask = mask.unsqueeze(0).unsqueeze(0)  # (1, 1, F, H, W)
         vace_mask = vace_mask.to(device=self.device, dtype=self.dtype)
 
         # --- 4. Video output ---
-        # Return clean stamped frames in [0,1] for the pipeline chain.
-        # Pipeline_processor will normalize to uint8 and queue for next pipeline.
         frames_01 = frames_stamped / 255.0  # (F, H, W, C), [0, 1]
 
         result = {"video": frames_01}
-
-        # Forward VACE mask — the barcode MUST be preserved through AI.
-        # The mask ensures AI generates everything except the barcode strip.
-        # NOTE: We intentionally do NOT include vace_input_frames here.
-        # Scope auto-routes the video queue to vace_input_frames when VACE is enabled.
         result["vace_input_masks"] = vace_mask
 
-        # Link state for diagnostics
-        result["_bpm_buffer_meta"] = {
-            "beat": self._clock.beat,
-            "bpm": self._clock.tempo,
-            "link_enabled": self._clock.enabled,
-            "frame_seq": self._frame_seq,
-        }
+        # Clock state for diagnostics
+        result["_bpm_buffer_meta"] = self._clock.source_info
+        result["_bpm_buffer_meta"]["frame_seq"] = self._frame_seq
 
         return result
 
@@ -475,14 +689,15 @@ if _HAS_SCOPE:
             "text": ModeDefaults(default=True),
         }
 
-        # Pydantic fields
+        # Pydantic fields — performance controls in Input & Controls (category="input")
+        # for MIDI mapping via Scope's native MIDI support
 
         buffer_mode: BufferMode = Field(
             default=BufferMode.LATENCY,
             json_schema_extra=ui_field_config(
                 order=0,
                 label="Buffer Mode",
-                is_load_param=False,
+                category="input",
             ),
         )
 
@@ -493,7 +708,7 @@ if _HAS_SCOPE:
             json_schema_extra=ui_field_config(
                 order=1,
                 label="Latency Buffer (ms)",
-                is_load_param=False,
+                category="input",
             ),
         )
 
@@ -504,7 +719,7 @@ if _HAS_SCOPE:
             json_schema_extra=ui_field_config(
                 order=2,
                 label="Beat Buffer Depth",
-                is_load_param=False,
+                category="input",
             ),
         )
 
@@ -513,7 +728,7 @@ if _HAS_SCOPE:
             json_schema_extra=ui_field_config(
                 order=3,
                 label="HOLD (freeze playback)",
-                is_load_param=False,
+                category="input",
             ),
         )
 
@@ -522,25 +737,45 @@ if _HAS_SCOPE:
             json_schema_extra=ui_field_config(
                 order=4,
                 label="Reset Buffer",
-                is_load_param=False,
+                category="input",
             ),
         )
 
-        link_sync: bool = Field(
-            default=False,
+        # Clock source — configuration panel (not performance controls)
+
+        clock_source: ClockSource = Field(
+            default=ClockSource.LINK,
             json_schema_extra=ui_field_config(
                 order=5,
-                label="Ableton Link Sync",
+                label="Clock Source",
             ),
         )
 
-        link_bpm: float = Field(
+        clock_bpm: float = Field(
             default=120.0,
             ge=20.0,
             le=999.0,
             json_schema_extra=ui_field_config(
                 order=6,
-                label="Link BPM",
+                label="Clock BPM (Link/Internal)",
+            ),
+        )
+
+        midi_device: str = Field(
+            default="",
+            json_schema_extra=ui_field_config(
+                order=7,
+                label="MIDI Clock Device",
+            ),
+        )
+
+        osc_beat: float = Field(
+            default=0.0,
+            ge=0.0,
+            json_schema_extra=ui_field_config(
+                order=8,
+                label="OSC Beat Position",
+                category="input",
             ),
         )
 
@@ -549,7 +784,7 @@ if _HAS_SCOPE:
             ge=4,
             le=128,
             json_schema_extra=ui_field_config(
-                order=7,
+                order=9,
                 label="Barcode Height (px)",
                 is_load_param=True,
             ),
@@ -560,7 +795,7 @@ if _HAS_SCOPE:
             ge=0.0,
             le=100.0,
             json_schema_extra=ui_field_config(
-                order=8,
+                order=10,
                 label="Buffer Fill %",
             ),
         )
@@ -575,8 +810,10 @@ else:
             self.beat_buffer_depth = kwargs.get("beat_buffer_depth", 4)
             self.hold = kwargs.get("hold", False)
             self.reset_buffer = kwargs.get("reset_buffer", False)
-            self.link_sync = kwargs.get("link_sync", False)
-            self.link_bpm = kwargs.get("link_bpm", 120.0)
+            self.clock_source = kwargs.get("clock_source", "link")
+            self.clock_bpm = kwargs.get("clock_bpm", 120.0)
+            self.midi_device = kwargs.get("midi_device", "")
+            self.osc_beat = kwargs.get("osc_beat", 0.0)
             self.barcode_height = kwargs.get("barcode_height", 16)
             self.buffer_fill_pct = kwargs.get("buffer_fill_pct", 0.0)
 
@@ -606,13 +843,16 @@ class BpmTimecodeStripPipeline(Pipeline):
     the FIFO for the closest frame. This gives smooth full-framerate playback
     at any delay depth — no stepped/stutter beat-locked behavior.
 
+    Clock sources (for beat buffer mode):
+      - Ableton Link: Networked beat sync with DAWs
+      - MIDI Clock: 24 PPQN from DJ software, drum machines
+      - Internal: Free-running at configured BPM
+
     Buffer modes:
       - no_buffer: Just strip the barcode (pass-through, simplest)
       - latency:   Adjustable latency (default) — FIFO + binary search with
                    configurable delay in ms (0-60000). MIDI fader assignable.
-                   Sliding shorter → catch up, sliding longer → buffer fills.
       - beat:      Beat-delayed — delay = beat_buffer_depth × ms_per_beat.
-                   Plays back every frame smoothly, delayed by N beats.
     """
 
     # 60 seconds at ~30fps = 1800 frames max
@@ -640,19 +880,19 @@ class BpmTimecodeStripPipeline(Pipeline):
         )
         self.dtype = dtype if self.device.type == "cuda" else torch.float32
 
-        # Ableton Link clock for local sync
-        self._clock: Optional[LinkClock] = None
-        self._link_active = False
+        # Initialize clock manager
+        initial_bpm = getattr(config, "clock_bpm", 120.0)
+        self._clock = ClockManager(initial_bpm)
 
-        # Auto-start Link if config says so
-        link_sync = getattr(config, "link_sync", False)
-        if link_sync:
-            link_bpm = getattr(config, "link_bpm", 120.0)
-            self._start_link(link_bpm)
+        source_str = getattr(config, "clock_source", "link")
+        try:
+            source = ClockSource(str(source_str))
+        except ValueError:
+            source = ClockSource.LINK
+        midi_device = getattr(config, "midi_device", "")
+        self._clock.set_source(source, bpm=initial_bpm, midi_device=midi_device)
 
         # --- Wall-clock FIFO buffers ---
-        # Beat mode and latency mode share the same architecture:
-        # append all frames with timestamp, binary search for target time
         self._beat_fifo: list[_BufferedFrame] = []
         self._latency_fifo: list[_BufferedFrame] = []
 
@@ -661,44 +901,26 @@ class BpmTimecodeStripPipeline(Pipeline):
 
         # Hold state — freezes target_time at the moment hold was engaged
         self._hold_active: bool = False
-        self._hold_target_time: float = 0.0  # frozen wall-clock target
+        self._hold_target_time: float = 0.0
 
-        # Extra delay accumulated during hold (added to beat delay on release)
+        # Extra delay accumulated during hold
         self._playback_extra_delay: float = 0.0
 
         # Stats
         self._decode_success = 0
         self._decode_fail = 0
 
-        logger.info("[BPM Buffer Output] Postprocessor initialized (wall-clock FIFO)")
-
-    def _start_link(self, bpm: float = 120.0):
-        """Start Ableton Link clock for local beat sync."""
-        if self._clock is not None:
-            return
-        self._clock = LinkClock(bpm)
-        self._clock.start(bpm)
-        self._link_active = True
-        logger.info(f"[BPM Buffer Output] Ableton Link started at {bpm} BPM")
-
-    def _stop_link(self):
-        """Stop Ableton Link clock."""
-        if self._clock is not None:
-            self._clock.stop()
-            self._clock = None
-        self._link_active = False
-        logger.info("[BPM Buffer Output] Ableton Link stopped")
+        logger.info(f"[BPM Buffer Output] Postprocessor initialized (clock={source.value})")
 
     def __del__(self):
-        if hasattr(self, "_clock") and self._clock is not None:
+        if hasattr(self, "_clock"):
             self._clock.stop()
 
     def _get_effective_bpm(self) -> float:
-        """Get BPM from Link clock → latest frame barcode → synthetic fallback."""
-        if self._link_active and self._clock is not None:
-            bpm = self._clock.tempo
-            if bpm and bpm > 0:
-                return bpm
+        """Get BPM from clock manager → latest frame barcode → synthetic fallback."""
+        bpm = self._clock.tempo
+        if bpm and bpm > 0:
+            return bpm
         # Try from latest frame in beat FIFO
         if self._beat_fifo:
             latest_bpm = self._beat_fifo[-1].bpm
@@ -725,8 +947,6 @@ class BpmTimecodeStripPipeline(Pipeline):
             else:
                 hi = mid
 
-        # lo is now the first frame >= target_time
-        # Check if the previous frame is actually closer
         best = fifo[lo]
         if lo > 0:
             prev = fifo[lo - 1]
@@ -741,7 +961,6 @@ class BpmTimecodeStripPipeline(Pipeline):
     ):
         """
         Evict frames older than target_time - keep_margin seconds.
-        Done BEFORE binary search to prevent returning stale frames.
         Always keeps at least 1 frame.
         """
         cutoff = target_time - keep_margin
@@ -770,17 +989,29 @@ class BpmTimecodeStripPipeline(Pipeline):
         latency_ms = kwargs.get("latency_delay_ms", getattr(self.config, "latency_delay_ms", 100))
         beat_depth = kwargs.get("beat_buffer_depth", getattr(self.config, "beat_buffer_depth", 4))
         reset_buffer = kwargs.get("reset_buffer", getattr(self.config, "reset_buffer", False))
-        link_sync = kwargs.get("link_sync", getattr(self.config, "link_sync", False))
         hold = kwargs.get("hold", getattr(self.config, "hold", False))
 
-        # --- Ableton Link toggle ---
-        if link_sync and not self._link_active:
-            link_bpm = kwargs.get("link_bpm", getattr(self.config, "link_bpm", 120.0))
-            self._start_link(link_bpm)
-        elif not link_sync and self._link_active:
-            self._stop_link()
+        # --- Clock source switching (runtime parameter updates) ---
+        clock_source_str = kwargs.get("clock_source", getattr(self.config, "clock_source", "link"))
+        clock_bpm = kwargs.get("clock_bpm", getattr(self.config, "clock_bpm", 120.0))
+        midi_device = kwargs.get("midi_device", getattr(self.config, "midi_device", ""))
 
-        # --- Reset buffer trigger (MIDI button assignable) ---
+        try:
+            target_source = ClockSource(str(clock_source_str))
+        except ValueError:
+            target_source = ClockSource.LINK
+
+        if target_source != self._clock.source:
+            self._clock.set_source(target_source, bpm=clock_bpm, midi_device=midi_device)
+        elif target_source == ClockSource.INTERNAL:
+            self._clock.set_internal_bpm(clock_bpm)
+
+        # Update OSC clock from parameters (pushed via /scope/osc_beat and /scope/clock_bpm)
+        if target_source == ClockSource.OSC:
+            osc_beat = kwargs.get("osc_beat", getattr(self.config, "osc_beat", 0.0))
+            self._clock.update_osc(beat=osc_beat, bpm=clock_bpm)
+
+        # --- Reset buffer trigger ---
         if reset_buffer:
             self._beat_fifo.clear()
             self._latency_fifo.clear()
@@ -791,7 +1022,6 @@ class BpmTimecodeStripPipeline(Pipeline):
 
         # --- Hold toggle ---
         if hold and not self._hold_active:
-            # Engage hold — freeze target_time at current playback position
             self._hold_active = True
             bpm = self._get_effective_bpm()
             ms_per_beat = 60_000.0 / bpm
@@ -799,7 +1029,6 @@ class BpmTimecodeStripPipeline(Pipeline):
             self._hold_target_time = time.monotonic() - delay_s
             logger.info(f"[BPM Buffer Output] HOLD engaged at target_time={self._hold_target_time:.3f}")
         elif not hold and self._hold_active:
-            # Release hold — the time that passed during hold becomes extra delay
             bpm = self._get_effective_bpm()
             ms_per_beat = 60_000.0 / bpm
             nominal_delay_s = (beat_depth * ms_per_beat) / 1000.0
@@ -838,13 +1067,8 @@ class BpmTimecodeStripPipeline(Pipeline):
                 bpm = decode_bpm(payload.bpm_encoded)
             else:
                 self._decode_fail += 1
-                # Use Link beat if available, otherwise synthetic
-                if self._link_active and self._clock is not None:
-                    beat = self._clock.beat
-                    bpm = self._clock.tempo
-                else:
-                    beat = 0.0
-                    bpm = self.SYNTHETIC_BPM
+                beat = self._clock.beat
+                bpm = self._clock.tempo if self._clock.tempo > 0 else self.SYNTHETIC_BPM
 
             # Strip barcode from output
             frame_np[-barcode_h:, :, :] = 0
@@ -869,22 +1093,18 @@ class BpmTimecodeStripPipeline(Pipeline):
         # Log every 100 frames for diagnostics
         total = self._decode_success + self._decode_fail
         if total % 100 == 1:
-            beat_fill = len(self._beat_fifo)
-            lat_fill = len(self._latency_fifo)
             logger.info(
                 f"[BPM Buffer Output] mode={mode}, decode={self._decode_success}/{total}, "
-                f"link={self._link_active}, hold={self._hold_active}, "
-                f"beat_fifo={beat_fill}, lat_fifo={lat_fill}, "
-                f"incoming={len(incoming)}"
+                f"clock={self._clock.source.value}, hold={self._hold_active}, "
+                f"beat_fifo={len(self._beat_fifo)}, lat_fifo={len(self._latency_fifo)}"
             )
 
         # Convert single output frame to tensor
-        out_tensor = torch.from_numpy(output_frame).float().unsqueeze(0) / 255.0  # (1, H, W, C) [0,1]
+        out_tensor = torch.from_numpy(output_frame).float().unsqueeze(0) / 255.0
 
         result = {"video": out_tensor}
 
-        # --- Buffer fill percentage (output to UI slider) ---
-        # Calculate how full the active buffer is relative to MAX_FIFO_FRAMES
+        # --- Buffer fill percentage ---
         if mode == "latency":
             active_fifo_size = len(self._latency_fifo)
         elif mode == "beat":
@@ -893,7 +1113,6 @@ class BpmTimecodeStripPipeline(Pipeline):
             active_fifo_size = 0
         buffer_fill_pct = min(100.0, (active_fifo_size / self.MAX_FIFO_FRAMES) * 100.0)
 
-        # Write back to config so Scope can display it on the read-only slider
         if hasattr(self.config, "buffer_fill_pct"):
             self.config.buffer_fill_pct = buffer_fill_pct
 
@@ -901,6 +1120,8 @@ class BpmTimecodeStripPipeline(Pipeline):
         total = self._decode_success + self._decode_fail
         rate = self._decode_success / total if total > 0 else 0.0
         bpm = self._get_effective_bpm()
+
+        clock_info = self._clock.source_info
         result["_bpm_buffer_output_meta"] = {
             "decode_rate": rate,
             "decode_success": self._decode_success,
@@ -912,10 +1133,7 @@ class BpmTimecodeStripPipeline(Pipeline):
             "hold_active": self._hold_active,
             "extra_delay_ms": self._playback_extra_delay,
             "effective_bpm": bpm,
-            "link_active": self._link_active,
-            "link_beat": self._clock.beat if self._clock else None,
-            "link_bpm": self._clock.tempo if self._clock else None,
-            "link_peers": self._clock.num_peers if self._clock else 0,
+            **clock_info,
         }
 
         return result
@@ -927,17 +1145,8 @@ class BpmTimecodeStripPipeline(Pipeline):
     ) -> np.ndarray:
         """
         Beat-delayed mode — wall-clock FIFO + binary search.
-
-        All frames are pushed into beat_fifo with their wall-clock timestamp.
-        On each call, we compute:
-            delay_ms = beat_depth × (60000 / bpm) + playback_extra_delay
-            target_time = now - delay_s
-        Then binary search for the closest frame to target_time.
-
-        This gives smooth full-framerate playback delayed by exactly N beats.
-        No stepped/stutter behavior — every frame plays in order.
+        Smooth full-framerate playback delayed by exactly N beats.
         """
-        # Ingest: push all incoming frames, hard cap only
         self._beat_fifo.extend(incoming)
         while len(self._beat_fifo) > self.MAX_FIFO_FRAMES:
             self._beat_fifo.pop(0)
@@ -945,7 +1154,6 @@ class BpmTimecodeStripPipeline(Pipeline):
         if not self._beat_fifo:
             return self._current_output if self._current_output is not None else incoming[-1].frame
 
-        # Compute target time
         bpm = self._get_effective_bpm()
         ms_per_beat = 60_000.0 / bpm
         delay_ms = beat_depth * ms_per_beat + self._playback_extra_delay
@@ -956,13 +1164,11 @@ class BpmTimecodeStripPipeline(Pipeline):
         else:
             target_time = time.monotonic() - delay_s
 
-        # Evict old frames BEFORE search (prevents returning stale data)
         self._evict_old_frames(self._beat_fifo, target_time, keep_margin=2.0)
 
         if not self._beat_fifo:
             return self._current_output if self._current_output is not None else incoming[-1].frame
 
-        # Binary search for closest frame
         frame = self._binary_search_closest(self._beat_fifo, target_time)
         if frame is not None:
             self._current_output = frame
@@ -974,16 +1180,8 @@ class BpmTimecodeStripPipeline(Pipeline):
     ) -> np.ndarray:
         """
         Latency compensation mode — wall-clock FIFO + binary search.
-
-        Same architecture as beat mode but with a direct ms delay parameter.
-        Sliding the delay shorter → playback speeds up to catch up.
-        Sliding the delay longer → playback slows until buffer fills.
-        This emergent behavior from continuous slider + binary search is
-        smooth and expressive — perfect for MIDI fader control.
-
-        delay_ms range: 0-60000 (0 to 60 seconds)
+        Smooth and expressive — perfect for MIDI fader control.
         """
-        # Ingest: push all incoming frames, hard cap only
         self._latency_fifo.extend(incoming)
         while len(self._latency_fifo) > self.MAX_FIFO_FRAMES:
             self._latency_fifo.pop(0)
@@ -991,17 +1189,14 @@ class BpmTimecodeStripPipeline(Pipeline):
         if not self._latency_fifo:
             return self._current_output if self._current_output is not None else incoming[-1].frame
 
-        # Compute target time
         delay_s = delay_ms / 1000.0
         target_time = time.monotonic() - delay_s
 
-        # Evict old frames BEFORE search
         self._evict_old_frames(self._latency_fifo, target_time, keep_margin=2.0)
 
         if not self._latency_fifo:
             return self._current_output if self._current_output is not None else incoming[-1].frame
 
-        # Binary search for closest frame
         frame = self._binary_search_closest(self._latency_fifo, target_time)
         if frame is not None:
             self._current_output = frame
