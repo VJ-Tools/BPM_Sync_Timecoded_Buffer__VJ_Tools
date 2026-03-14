@@ -2,22 +2,25 @@
 BPM Timecoded Buffer — Beat-Grid Timecoding Pipeline for Daydream Scope
 
 Preprocessor that:
-1. Joins an Ableton Link session OR listens for MIDI clock for a shared beat clock
+1. Joins an Ableton Link session, listens for MIDI clock, or receives OSC beat data
 2. Stamps a VJSync barcode on each input frame (encoding current beat position)
-3. Creates a VACE inpainting mask that preserves the barcode through AI generation
 
-The barcode survives AI processing via VACE masking (mask=0 = preserve).
-The client decodes the surviving barcode on the output to know exactly which
-beat produced each frame — regardless of variable Scope inference latency.
+The barcode survives AI processing through BCH error correction:
+  - BCH(71,50,3): corrects up to 3 bit errors per codeword
+  - High-contrast NRZ encoding (16/235 ITU-R levels)
+  - Redundant 6px-wide bars for diffusion robustness
+  - Timing correlation fallback when barcode decode rate drops
+
+NOTE: The preprocessor does NOT output vace_input_masks. The preprocessor runs
+at INPUT resolution (e.g. 256×256, 1 frame) but the main pipeline's VACE block
+expects masks at GENERATION resolution (e.g. 320×576, 13 frames). The frame count
+is an internal detail of the main pipeline that the preprocessor cannot know.
 
 Clock sources:
   - Ableton Link: Networked beat sync with DAWs and other Link-enabled apps
   - MIDI Clock: Standard MIDI timing (24 PPQN) from DJ software, drum machines, etc.
-  - Free-running: Internal clock at configured BPM (fallback when no external sync)
-
-VACE integration follows Scope's dual-stream encoding:
-  - vace_input_masks:  [1, 1, F, H, W] binary — 1=inpaint, 0=preserve
-  Scope internally splits: inactive = frame*(1-mask), reactive = frame*mask
+  - OSC: Beat position and BPM pushed from external software via /scope/osc_beat
+  - Internal: Free-running clock at configured BPM (fallback when no external sync)
 
 Barcode spec:
   - 16px tall, full frame width, bottom of frame
@@ -444,21 +447,10 @@ if _HAS_SCOPE:
             ),
         )
 
-        mask_feather: int = Field(
-            default=2,
-            ge=0,
-            le=16,
-            json_schema_extra=ui_field_config(
-                order=5,
-                label="Mask Feather (px)",
-                is_load_param=False,
-            ),
-        )
-
         test_input: bool = Field(
             default=False,
             json_schema_extra=ui_field_config(
-                order=6,
+                order=5,
                 label="Test Pattern Input",
                 is_load_param=False,
             ),
@@ -474,7 +466,6 @@ else:
             self.midi_device = kwargs.get("midi_device", "")
             self.osc_beat = kwargs.get("osc_beat", 0.0)
             self.barcode_height = kwargs.get("barcode_height", 16)
-            self.mask_feather = kwargs.get("mask_feather", 2)
             self.test_input = kwargs.get("test_input", False)
 
 
@@ -562,7 +553,6 @@ class BpmTimecodedBufferPipeline(Pipeline):
         """
         video = kwargs.get("video", [])
         barcode_h = kwargs.get("barcode_height", getattr(self.config, "barcode_height", 16))
-        mask_feather = kwargs.get("mask_feather", getattr(self.config, "mask_feather", 2))
         test_input = kwargs.get("test_input", getattr(self.config, "test_input", False))
 
         # --- Clock source switching (runtime parameter updates) ---
@@ -631,34 +621,27 @@ class BpmTimecodedBufferPipeline(Pipeline):
         # Convert back to tensor with stamped barcodes
         frames_stamped = torch.from_numpy(frames_np).float()
 
-        # --- 2. Generate VACE mask ---
-        # mask=1 -> inpaint (AI generates everything above barcode)
-        # mask=0 -> preserve (barcode strip survives AI untouched)
-        mask = torch.ones(F, H, W, dtype=torch.float32)
-        mask[:, -barcode_h:, :] = 0.0  # Preserve barcode strip
-
-        # Feathering at boundary for smooth transition
-        if mask_feather > 0:
-            boundary_y = H - barcode_h
-            for dy in range(mask_feather):
-                if boundary_y - dy - 1 >= 0:
-                    alpha = (dy + 1) / (mask_feather + 1)
-                    mask[:, boundary_y - dy - 1, :] = alpha
-
-        # --- 3. Build VACE mask ---
-        # Only forward the mask, NOT vace_input_frames.
-        # Scope's pipeline_processor checks "vace_input_frames" not in call_params
-        # before routing video from the queue. If we include vace_input_frames,
-        # it blocks the video input for non-VACE pipelines (like passthrough),
-        # causing "Input cannot be None" errors.
-        vace_mask = mask.unsqueeze(0).unsqueeze(0)  # (1, 1, F, H, W)
-        vace_mask = vace_mask.to(device=self.device, dtype=self.dtype)
-
-        # --- 4. Video output ---
+        # --- 2. Video output ---
+        # Return stamped frames in [0,1] for the pipeline chain.
+        #
+        # NOTE: We intentionally do NOT output vace_input_masks here.
+        # The preprocessor runs at INPUT resolution (e.g. 256×256, 1 frame),
+        # but the main pipeline's VACE block expects masks at GENERATION
+        # resolution (e.g. 320×576, 13 frames). The preprocessor cannot know
+        # the main pipeline's frame count or resolution ahead of time.
+        #
+        # Instead, the barcode survives AI generation through:
+        #   1. BCH(71,50,3) error correction — corrects up to 3 bit errors
+        #   2. High-contrast NRZ encoding (16/235 ITU-R levels)
+        #   3. Redundant 6px-wide bars for diffusion robustness
+        #   4. Timing correlation fallback in the postprocessor when
+        #      barcode decode rate drops below threshold
+        #
+        # For additional VACE protection, users can manually configure a
+        # VACE mask in Scope's UI (black strip at bottom = preserve region).
         frames_01 = frames_stamped / 255.0  # (F, H, W, C), [0, 1]
 
         result = {"video": frames_01}
-        result["vace_input_masks"] = vace_mask
 
         # Clock state for diagnostics
         result["_bpm_buffer_meta"] = self._clock.source_info

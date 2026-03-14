@@ -32,8 +32,8 @@ def _stack_video(video_out):
     return video_out
 
 
-def test_basic_mask():
-    """Test that the pipeline generates correct VACE mask dimensions."""
+def test_basic_output():
+    """Test that the pipeline generates correct video output dimensions."""
     from bpm_sync_timecoded_buffer.pipeline import BpmTimecodedBufferPipeline, BpmBufferConfig
 
     config = BpmBufferConfig()
@@ -43,25 +43,25 @@ def test_basic_mask():
     result = pipeline(video=[frame], barcode_height=16)
 
     assert "video" in result
-    # Only vace_input_masks is returned (not vace_input_frames)
-    # Scope auto-routes video to vace_input_frames when VACE is enabled
-    assert "vace_input_masks" in result
+    # Preprocessor does NOT output vace_input_masks or vace_input_frames
+    # (shape mismatch: preprocessor runs at input resolution but VACE expects
+    # generation resolution + frame count). Barcode survives via BCH ECC.
+    assert "vace_input_masks" not in result, "vace_input_masks must NOT be in result"
+    assert "vace_input_frames" not in result, "vace_input_frames must NOT be in result"
 
     video = _stack_video(result["video"])
-    vace_masks = result["vace_input_masks"]
 
     assert video.shape == (1, 336, 576, 3), f"Video shape wrong: {video.shape}"
-    assert vace_masks.shape == (1, 1, 1, 336, 576), f"VACE mask shape wrong: {vace_masks.shape}"
 
     # Video is float [0, 1]
     assert video.max() <= 1.0
     assert video.min() >= 0.0
 
-    print("  [OK] Basic mask test passed")
+    print("  [OK] Basic output test passed")
 
 
-def test_vace_mask_always_present():
-    """Test that VACE mask is ALWAYS present (barcode must always be preserved)."""
+def test_no_vace_in_output():
+    """Test that preprocessor does NOT include VACE params (prevents shape mismatch)."""
     from bpm_sync_timecoded_buffer.pipeline import BpmTimecodedBufferPipeline, BpmBufferConfig
 
     config = BpmBufferConfig()
@@ -71,32 +71,12 @@ def test_vace_mask_always_present():
     result = pipeline(video=[frame], barcode_height=16)
 
     assert "video" in result
-    assert "vace_input_masks" in result, "VACE mask must always be present"
-    # vace_input_frames should NOT be in result (blocks passthrough pipeline)
+    # Neither VACE key should be present — they cause shape mismatches
+    # with the main pipeline (e.g. LongLive expects [B,1,13,H,W])
+    assert "vace_input_masks" not in result, "vace_input_masks must NOT be in result"
     assert "vace_input_frames" not in result, "vace_input_frames must NOT be in result"
 
-    print("  [OK] VACE mask always present test passed")
-
-
-def test_barcode_preserved():
-    """Test that the barcode region has mask=0 (preserve)."""
-    from bpm_sync_timecoded_buffer.pipeline import BpmTimecodedBufferPipeline, BpmBufferConfig
-
-    config = BpmBufferConfig()
-    pipeline = BpmTimecodedBufferPipeline(config)
-
-    barcode_h = 16
-    frame = make_test_frame(barcode_height=barcode_h)
-    result = pipeline(video=[frame], barcode_height=barcode_h)
-
-    vace_masks = result["vace_input_masks"]
-    barcode_mask = vace_masks[0, 0, 0, -barcode_h:, :]
-    assert barcode_mask.max() == 0.0, f"Barcode region should be all 0, got max={barcode_mask.max()}"
-
-    content_mask = vace_masks[0, 0, 0, :-barcode_h, :]
-    assert content_mask[0, 0] == 1.0, f"Content region should start at 1.0, got {content_mask[0, 0]}"
-
-    print("  [OK] Barcode preservation test passed")
+    print("  [OK] No VACE in output test passed")
 
 
 def test_barcode_in_video_output():
@@ -131,7 +111,6 @@ def test_multi_frame():
 
     video = _stack_video(result["video"])
     assert video.shape[0] == 4
-    assert result["vace_input_masks"].shape[2] == 4
 
     print("  [OK] Multi-frame test passed")
 
@@ -147,7 +126,6 @@ def test_test_pattern_input():
     result = pipeline(video=[frame], barcode_height=16, test_input=True)
 
     assert "video" in result
-    assert "vace_input_masks" in result
 
     video = _stack_video(result["video"])
     assert video.shape == (1, 336, 576, 3), f"Video shape wrong: {video.shape}"
@@ -322,9 +300,8 @@ if __name__ == "__main__":
     print("\n=== BPM Timecoded Buffer Pipeline Tests ===\n")
 
     tests = [
-        test_basic_mask,
-        test_vace_mask_always_present,
-        test_barcode_preserved,
+        test_basic_output,
+        test_no_vace_in_output,
         test_barcode_in_video_output,
         test_multi_frame,
         test_test_pattern_input,
