@@ -415,27 +415,31 @@ class BpmTimecodedBufferPipeline(Pipeline):
                     alpha = (dy + 1) / (mask_feather + 1)
                     mask[:, boundary_y - dy - 1, :] = alpha
 
-        # --- 3. Build VACE tensors ---
-        frames_01 = frames_stamped / 255.0  # (F, H, W, C), [0, 1]
-        vace_frames = (frames_01 * 2.0 - 1.0).permute(3, 0, 1, 2).unsqueeze(0)
-        # -> (1, C=3, F, H, W), [-1, 1]
-        vace_frames = vace_frames.to(device=self.device, dtype=self.dtype)
-
+        # --- 3. Build VACE mask ---
+        # Only forward the mask, NOT vace_input_frames.
+        # Scope's pipeline_processor checks "vace_input_frames" not in call_params
+        # before routing video from the queue. If we include vace_input_frames,
+        # it blocks the video input for non-VACE pipelines (like passthrough),
+        # causing "Input cannot be None" errors.
+        #
+        # By only providing the mask, Scope will:
+        # - Route our stamped video through the queue to the main pipeline
+        # - If VACE is enabled, auto-route the video as vace_input_frames
+        # - Apply our custom mask (barcode=0=preserve, content=1=generate)
         vace_mask = mask.unsqueeze(0).unsqueeze(0)  # (1, 1, F, H, W)
         vace_mask = vace_mask.to(device=self.device, dtype=self.dtype)
 
-        # --- 4. Display output ---
-        # Show barcode with subtle green tint so you can verify it's there
-        display = frames_01.clone()
-        mask_cpu = mask.unsqueeze(-1)  # (F, H, W, 1)
-        preserve = 1.0 - mask_cpu
-        display = (display + preserve * torch.tensor([0.0, 0.05, 0.0])).clamp(0.0, 1.0)
+        # --- 4. Video output ---
+        # Return clean stamped frames in [0,1] for the pipeline chain.
+        # Pipeline_processor will normalize to uint8 and queue for next pipeline.
+        frames_01 = frames_stamped / 255.0  # (F, H, W, C), [0, 1]
 
-        result = {"video": display}
+        result = {"video": frames_01}
 
-        # Always forward VACE tensors — the barcode MUST be preserved through AI.
+        # Forward VACE mask — the barcode MUST be preserved through AI.
         # The mask ensures AI generates everything except the barcode strip.
-        result["vace_input_frames"] = vace_frames
+        # NOTE: We intentionally do NOT include vace_input_frames here.
+        # Scope auto-routes the video queue to vace_input_frames when VACE is enabled.
         result["vace_input_masks"] = vace_mask
 
         # Link state for diagnostics

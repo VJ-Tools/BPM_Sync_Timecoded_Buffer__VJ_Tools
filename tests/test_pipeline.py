@@ -43,26 +43,25 @@ def test_basic_mask():
     result = pipeline(video=[frame], barcode_height=16)
 
     assert "video" in result
-    assert "vace_input_frames" in result
+    # Only vace_input_masks is returned (not vace_input_frames)
+    # Scope auto-routes video to vace_input_frames when VACE is enabled
     assert "vace_input_masks" in result
 
     video = _stack_video(result["video"])
-    vace_frames = result["vace_input_frames"]
     vace_masks = result["vace_input_masks"]
 
     assert video.shape == (1, 336, 576, 3), f"Video shape wrong: {video.shape}"
-    assert vace_frames.shape == (1, 3, 1, 336, 576), f"VACE frames shape wrong: {vace_frames.shape}"
     assert vace_masks.shape == (1, 1, 1, 336, 576), f"VACE mask shape wrong: {vace_masks.shape}"
 
-    # Video is now uint8 [0, 255]
-    assert video.max() <= 255
-    assert vace_frames.min() >= -1.0 and vace_frames.max() <= 1.0
+    # Video is float [0, 1]
+    assert video.max() <= 1.0
+    assert video.min() >= 0.0
 
     print("  [OK] Basic mask test passed")
 
 
-def test_vace_always_present():
-    """Test that VACE keys are ALWAYS present (barcode must always be preserved)."""
+def test_vace_mask_always_present():
+    """Test that VACE mask is ALWAYS present (barcode must always be preserved)."""
     from bpm_sync_timecoded_buffer.pipeline import BpmTimecodedBufferPipeline, BpmBufferConfig
 
     config = BpmBufferConfig()
@@ -72,10 +71,11 @@ def test_vace_always_present():
     result = pipeline(video=[frame], barcode_height=16)
 
     assert "video" in result
-    assert "vace_input_frames" in result, "VACE frames must always be present"
-    assert "vace_input_masks" in result, "VACE masks must always be present"
+    assert "vace_input_masks" in result, "VACE mask must always be present"
+    # vace_input_frames should NOT be in result (blocks passthrough pipeline)
+    assert "vace_input_frames" not in result, "vace_input_frames must NOT be in result"
 
-    print("  [OK] VACE always present test passed")
+    print("  [OK] VACE mask always present test passed")
 
 
 def test_barcode_preserved():
@@ -99,8 +99,8 @@ def test_barcode_preserved():
     print("  [OK] Barcode preservation test passed")
 
 
-def test_barcode_in_vace_frames():
-    """Test that vace_input_frames contain actual barcode data (not pre-masked)."""
+def test_barcode_in_video_output():
+    """Test that video output contains actual barcode data (stamped by preprocessor)."""
     from bpm_sync_timecoded_buffer.pipeline import BpmTimecodedBufferPipeline, BpmBufferConfig
 
     config = BpmBufferConfig()
@@ -110,13 +110,13 @@ def test_barcode_in_vace_frames():
     frame = make_test_frame(barcode_height=barcode_h)
     result = pipeline(video=[frame], barcode_height=barcode_h)
 
-    vace_frames = result["vace_input_frames"]
-    barcode_region = vace_frames[0, :, 0, -barcode_h:, :]
-    barcode_uint8 = ((barcode_region + 1.0) / 2.0 * 255.0).cpu().numpy().astype(np.uint8)
+    video = _stack_video(result["video"])
+    barcode_region = video[0, -barcode_h:, :, :]
+    barcode_uint8 = (barcode_region * 255.0).cpu().numpy().astype(np.uint8)
     unique_vals = np.unique(barcode_uint8)
-    assert len(unique_vals) >= 2, f"VACE frames should have barcode data, got: {unique_vals}"
+    assert len(unique_vals) >= 2, f"Video output should have barcode data, got: {unique_vals}"
 
-    print("  [OK] Barcode in VACE frames test passed")
+    print("  [OK] Barcode in video output test passed")
 
 
 def test_multi_frame():
@@ -131,7 +131,6 @@ def test_multi_frame():
 
     video = _stack_video(result["video"])
     assert video.shape[0] == 4
-    assert result["vace_input_frames"].shape[2] == 4
     assert result["vace_input_masks"].shape[2] == 4
 
     print("  [OK] Multi-frame test passed")
@@ -148,7 +147,6 @@ def test_test_pattern_input():
     result = pipeline(video=[frame], barcode_height=16, test_input=True)
 
     assert "video" in result
-    assert "vace_input_frames" in result
     assert "vace_input_masks" in result
 
     video = _stack_video(result["video"])
@@ -279,9 +277,9 @@ if __name__ == "__main__":
 
     tests = [
         test_basic_mask,
-        test_vace_always_present,
+        test_vace_mask_always_present,
         test_barcode_preserved,
-        test_barcode_in_vace_frames,
+        test_barcode_in_video_output,
         test_multi_frame,
         test_test_pattern_input,
         test_set_bpm,
