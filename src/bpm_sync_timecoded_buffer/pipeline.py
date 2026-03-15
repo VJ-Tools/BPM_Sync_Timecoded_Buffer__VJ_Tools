@@ -525,8 +525,12 @@ class BpmTimecodedBufferPipeline(Pipeline):
             self._test_source.set_bpm(bpm)
         logger.info(f"[BPM Buffer] Manual BPM: {bpm:.1f}")
 
-    # No prepare() — let Scope feed us the full chunk (matching main pipeline).
-    # This is required for VACE masks to match the expected frame count.
+    # Wan2.1 default: num_frame_per_block(3) × vae_temporal_downsample(4) = 12
+    _DEFAULT_CHUNK_SIZE = 12
+
+    def prepare(self, **kwargs) -> "Requirements":
+        """Request same chunk size as main pipeline for VACE tensor alignment."""
+        return Requirements(input_size=self._DEFAULT_CHUNK_SIZE)
 
     # VAE alignment — diffusion models require spatial dims divisible by this
     _VAE_ALIGN = 8
