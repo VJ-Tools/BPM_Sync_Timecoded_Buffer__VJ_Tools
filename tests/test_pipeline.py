@@ -50,11 +50,9 @@ def test_basic_output():
     assert video.max() <= 1.0
     assert video.min() >= 0.0
 
-    # VACE mask is always generated (falls back to input dims aligned to VAE)
-    assert "vace_input_masks" in result, "VACE mask should always be present"
-    # 336 and 576 are already divisible by 8
-    vace_masks = result["vace_input_masks"]
-    assert vace_masks.shape == (1, 1, 1, 336, 576), f"VACE mask shape wrong: {vace_masks.shape}"
+    # Without input_size/num_frames in kwargs, VACE mask is skipped
+    # (preprocessor can't know the main pipeline's frame count)
+    assert "vace_input_masks" not in result, "Without frame count kwarg, no VACE mask"
 
     print("  [OK] Basic output test passed")
 

@@ -622,39 +622,67 @@ class BpmTimecodedBufferPipeline(Pipeline):
 
         result = {"video": frames_01}
 
-        # --- 3. Generate VACE mask ---
-        # Scope broadcasts all pipeline params (height, width, input_size) to
-        # every pipeline in the chain, so we read generation dims from kwargs.
-        # If not provided, fall back to input dims aligned to VAE block size.
+        # --- 3. Generate VACE mask at generation resolution ---
+        # Scope broadcasts pipeline params to every pipeline in the chain.
+        # We need height, width, AND frame count to match the main pipeline's
+        # VaceEncodingBlock expectations.
+        #
+        # Log all kwargs on first few calls so we can diagnose param names.
+        if self._frame_seq <= F * 3:
+            kwarg_keys = {k: type(v).__name__ for k, v in kwargs.items() if k != "video"}
+            logger.info(f"[BPM Buffer] kwargs keys: {kwarg_keys}")
+
         gen_h = int(kwargs.get("height", self._align(H, self._VAE_ALIGN)))
         gen_w = int(kwargs.get("width", self._align(W, self._VAE_ALIGN)))
-        gen_frames = int(kwargs.get("input_size", F))
 
-        # Ensure alignment even if Scope passes non-aligned values
-        gen_h = self._align(gen_h, self._VAE_ALIGN)
-        gen_w = self._align(gen_w, self._VAE_ALIGN)
+        # Frame count: try multiple kwarg names that Scope might use.
+        # The main pipeline processes chunks of N frames (e.g. 13), but the
+        # preprocessor only sees 1 frame at a time. We need the main pipeline's
+        # frame count to size the VACE mask correctly.
+        gen_frames = None
+        for key in ("input_size", "num_frames", "video_length", "chunk_size", "num_inference_steps"):
+            val = kwargs.get(key)
+            if val is not None:
+                gen_frames = int(val)
+                if self._frame_seq <= F * 3:
+                    logger.info(f"[BPM Buffer] Found frame count from '{key}' = {gen_frames}")
+                break
 
-        # Scale barcode height proportionally to generation resolution
-        scale_y = gen_h / H if H > 0 else 1.0
-        barcode_h_gen = max(4, round(barcode_h * scale_y))
+        if gen_frames is None or gen_frames < 1:
+            # Cannot determine main pipeline's frame count — skip VACE mask
+            # to avoid shape mismatch. Barcode still survives via BCH error
+            # correction (corrects up to 3 bit errors per codeword).
+            if self._frame_seq <= F * 3:
+                logger.warning(
+                    f"[BPM Buffer] Cannot determine generation frame count from kwargs. "
+                    f"Skipping vace_input_masks. Barcode relies on BCH error correction only."
+                )
+        else:
+            # Ensure alignment even if Scope passes non-aligned values
+            gen_h = self._align(gen_h, self._VAE_ALIGN)
+            gen_w = self._align(gen_w, self._VAE_ALIGN)
 
-        # mask=1 -> AI generates (content area)
-        # mask=0 -> preserve (barcode strip at bottom)
-        vace_mask = torch.ones(gen_frames, gen_h, gen_w, dtype=torch.float32)
-        vace_mask[:, -barcode_h_gen:, :] = 0.0  # Preserve barcode strip
+            # Scale barcode height proportionally to generation resolution
+            scale_y = gen_h / H if H > 0 else 1.0
+            barcode_h_gen = max(4, round(barcode_h * scale_y))
 
-        # Reshape to [B=1, C=1, F, H, W] as expected by VaceEncodingBlock
-        vace_mask = vace_mask.unsqueeze(0).unsqueeze(0)  # (1, 1, gen_frames, gen_h, gen_w)
-        vace_mask = vace_mask.to(device=self.device, dtype=self.dtype)
+            # mask=1 -> AI generates (content area)
+            # mask=0 -> preserve (barcode strip at bottom)
+            vace_mask = torch.ones(gen_frames, gen_h, gen_w, dtype=torch.float32)
+            vace_mask[:, -barcode_h_gen:, :] = 0.0  # Preserve barcode strip
 
-        result["vace_input_masks"] = vace_mask
+            # Reshape to [B=1, C=1, F, H, W] as expected by VaceEncodingBlock
+            vace_mask = vace_mask.unsqueeze(0).unsqueeze(0)
+            vace_mask = vace_mask.to(device=self.device, dtype=self.dtype)
 
-        if self._frame_seq <= F * 3:
-            logger.info(
-                f"[BPM Buffer] Input {F}×{H}×{W} → VACE mask "
-                f"[1,1,{gen_frames},{gen_h},{gen_w}], "
-                f"barcode={barcode_h}px→{barcode_h_gen}px"
-            )
+            result["vace_input_masks"] = vace_mask
+
+            if self._frame_seq <= F * 3:
+                logger.info(
+                    f"[BPM Buffer] Input {F}×{H}×{W} → VACE mask "
+                    f"[1,1,{gen_frames},{gen_h},{gen_w}], "
+                    f"barcode={barcode_h}px→{barcode_h_gen}px"
+                )
 
         # Clock state for diagnostics
         result["_bpm_buffer_meta"] = self._clock.source_info
