@@ -50,9 +50,9 @@ def test_basic_output():
     assert video.max() <= 1.0
     assert video.min() >= 0.0
 
-    # VACE mask is always generated (defaults to 13-frame Wan2.1 chunk)
+    # VACE mask matches input frame count (1 frame in this test)
     assert "vace_input_masks" in result, "VACE mask should always be present"
-    assert result["vace_input_masks"].shape[2] == 13, "Default chunk size should be 13"
+    assert result["vace_input_masks"].shape[2] == 1, "VACE frames should match input"
 
     print("  [OK] Basic output test passed")
 

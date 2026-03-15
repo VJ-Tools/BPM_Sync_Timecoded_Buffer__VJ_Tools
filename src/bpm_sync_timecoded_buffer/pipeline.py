@@ -526,8 +526,8 @@ class BpmTimecodedBufferPipeline(Pipeline):
         logger.info(f"[BPM Buffer] Manual BPM: {bpm:.1f}")
 
     def prepare(self, **kwargs) -> "Requirements":
-        """Tell Scope how many input frames we need per call."""
-        return Requirements(input_size=1)
+        """Let Scope decide chunk size so VACE mask matches main pipeline."""
+        return Requirements()
 
     # VAE alignment — diffusion models require spatial dims divisible by this
     _VAE_ALIGN = 8
@@ -623,46 +623,20 @@ class BpmTimecodedBufferPipeline(Pipeline):
         result = {"video": frames_01}
 
         # --- 3. Generate VACE mask at generation resolution ---
-        # Scope broadcasts pipeline params to every pipeline in the chain.
-        # We need height, width, AND frame count to match the main pipeline's
-        # VaceEncodingBlock expectations.
+        # By not setting input_size in prepare(), Scope feeds us the same
+        # chunk size as the main pipeline. F = len(video) IS the correct
+        # frame count for the VACE mask.
         #
-        # Log all kwargs on first few calls so we can diagnose param names.
-        # Use print() to bypass Scope's log-level filtering.
+        # Log kwargs on first few calls for diagnostics.
         if self._frame_seq <= F * 3:
             kwarg_keys = {k: type(v).__name__ for k, v in kwargs.items() if k != "video"}
-            print(f"[BPM Buffer] kwargs keys: {kwarg_keys}", flush=True)
+            print(f"[BPM Buffer] F={F}, kwargs keys: {kwarg_keys}", flush=True)
 
         gen_h = int(kwargs.get("height", self._align(H, self._VAE_ALIGN)))
         gen_w = int(kwargs.get("width", self._align(W, self._VAE_ALIGN)))
+        gen_frames = F  # Match the actual chunk Scope gave us
 
-        # Frame count: try multiple kwarg names that Scope might use.
-        # The main pipeline processes chunks of N frames (e.g. 13), but the
-        # preprocessor only sees 1 frame at a time. We need the main pipeline's
-        # frame count to size the VACE mask correctly.
-        gen_frames = None
-        for key in ("input_size", "num_frames", "video_length", "chunk_size", "num_inference_steps"):
-            val = kwargs.get(key)
-            if val is not None:
-                gen_frames = int(val)
-                if self._frame_seq <= F * 3:
-                    print(f"[BPM Buffer] Found frame count from '{key}' = {gen_frames}", flush=True)
-                break
-
-        # Wan2.1 uses 13-frame chunks. Default to 13 if Scope doesn't
-        # broadcast the frame count — VACE mask MUST match or diffusion
-        # destroys the barcode.
-        _WAN21_CHUNK = 13
-        if gen_frames is None or gen_frames < 1:
-            gen_frames = _WAN21_CHUNK
-            if self._frame_seq <= F * 3:
-                print(
-                    f"[BPM Buffer] No frame count in kwargs, defaulting to {_WAN21_CHUNK} "
-                    f"(Wan2.1 chunk size) for VACE mask.",
-                    flush=True,
-                )
-
-        if gen_frames is not None and gen_frames >= 1:
+        if gen_frames >= 1:
             # Ensure alignment even if Scope passes non-aligned values
             gen_h = self._align(gen_h, self._VAE_ALIGN)
             gen_w = self._align(gen_w, self._VAE_ALIGN)
