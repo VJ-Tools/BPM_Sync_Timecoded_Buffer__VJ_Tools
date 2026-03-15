@@ -4,17 +4,16 @@ BPM Timecoded Buffer — Beat-Grid Timecoding Pipeline for Daydream Scope
 Preprocessor that:
 1. Joins an Ableton Link session, listens for MIDI clock, or receives OSC beat data
 2. Stamps a VJSync barcode on each input frame (encoding current beat position)
+3. Creates a VACE inpainting mask at generation resolution to preserve the barcode
 
-The barcode survives AI processing through BCH error correction:
-  - BCH(71,50,3): corrects up to 3 bit errors per codeword
-  - High-contrast NRZ encoding (16/235 ITU-R levels)
-  - Redundant 6px-wide bars for diffusion robustness
-  - Timing correlation fallback when barcode decode rate drops
+The barcode is protected through two layers:
+  - VACE masking: mask=0 at barcode strip tells the AI to preserve that region
+  - BCH(71,50,3) error correction: corrects up to 3 bit errors as backup
 
-NOTE: The preprocessor does NOT output vace_input_masks. The preprocessor runs
-at INPUT resolution (e.g. 256×256, 1 frame) but the main pipeline's VACE block
-expects masks at GENERATION resolution (e.g. 320×576, 13 frames). The frame count
-is an internal detail of the main pipeline that the preprocessor cannot know.
+The VACE mask is generated at the main pipeline's GENERATION resolution
+(height/width/input_size from kwargs), NOT the input video resolution.
+Scope broadcasts all pipeline parameters to every pipeline in the chain,
+so the preprocessor reads the generation dimensions from kwargs.
 
 Clock sources:
   - Ableton Link: Networked beat sync with DAWs and other Link-enabled apps
@@ -436,17 +435,6 @@ if _HAS_SCOPE:
             ),
         )
 
-        barcode_height: int = Field(
-            default=16,
-            ge=4,
-            le=128,
-            json_schema_extra=ui_field_config(
-                order=4,
-                label="Barcode Height (px)",
-                is_load_param=False,
-            ),
-        )
-
         test_input: bool = Field(
             default=False,
             json_schema_extra=ui_field_config(
@@ -465,7 +453,6 @@ else:
             self.clock_bpm = kwargs.get("clock_bpm", 120.0)
             self.midi_device = kwargs.get("midi_device", "")
             self.osc_beat = kwargs.get("osc_beat", 0.0)
-            self.barcode_height = kwargs.get("barcode_height", 16)
             self.test_input = kwargs.get("test_input", False)
 
 
@@ -542,6 +529,14 @@ class BpmTimecodedBufferPipeline(Pipeline):
         """Tell Scope how many input frames we need per call."""
         return Requirements(input_size=1)
 
+    # VAE alignment — diffusion models require spatial dims divisible by this
+    _VAE_ALIGN = 8
+
+    @staticmethod
+    def _align(value: int, alignment: int) -> int:
+        """Round up to nearest multiple of alignment."""
+        return ((value + alignment - 1) // alignment) * alignment
+
     def __call__(self, **kwargs) -> dict:
         """
         Process input frames (Scope Pipeline interface).
@@ -552,7 +547,9 @@ class BpmTimecodedBufferPipeline(Pipeline):
             dict with video, vace_input_masks
         """
         video = kwargs.get("video", [])
-        barcode_h = kwargs.get("barcode_height", getattr(self.config, "barcode_height", 16))
+        # Barcode height is fixed by VJSync codec spec — not configurable.
+        # The decoder auto-detects via sync pattern, so encoder must match exactly.
+        barcode_h = STRIP_HEIGHT
         test_input = kwargs.get("test_input", getattr(self.config, "test_input", False))
 
         # --- Clock source switching (runtime parameter updates) ---
@@ -588,13 +585,12 @@ class BpmTimecodedBufferPipeline(Pipeline):
             if self._test_source is None or self._test_source.width != W or self._test_source.height != H:
                 self._test_source = TestPatternSource(width=W, height=H)
             video = self._test_source.generate_batch(
-                self._clock, num_frames=len(video), barcode_height=barcode_h
+                self._clock, num_frames=len(video), barcode_height=STRIP_HEIGHT
             )
 
         # Stack frames
         frames = torch.cat(video, dim=0).float()  # (F, H, W, C), [0, 255]
         F, H, W, C = frames.shape
-        barcode_h = min(barcode_h, H // 4)
 
         # --- 1. Stamp barcode on each frame using beat clock ---
         frames_np = frames.cpu().numpy().astype(np.uint8)
@@ -622,26 +618,43 @@ class BpmTimecodedBufferPipeline(Pipeline):
         frames_stamped = torch.from_numpy(frames_np).float()
 
         # --- 2. Video output ---
-        # Return stamped frames in [0,1] for the pipeline chain.
-        #
-        # NOTE: We intentionally do NOT output vace_input_masks here.
-        # The preprocessor runs at INPUT resolution (e.g. 256×256, 1 frame),
-        # but the main pipeline's VACE block expects masks at GENERATION
-        # resolution (e.g. 320×576, 13 frames). The preprocessor cannot know
-        # the main pipeline's frame count or resolution ahead of time.
-        #
-        # Instead, the barcode survives AI generation through:
-        #   1. BCH(71,50,3) error correction — corrects up to 3 bit errors
-        #   2. High-contrast NRZ encoding (16/235 ITU-R levels)
-        #   3. Redundant 6px-wide bars for diffusion robustness
-        #   4. Timing correlation fallback in the postprocessor when
-        #      barcode decode rate drops below threshold
-        #
-        # For additional VACE protection, users can manually configure a
-        # VACE mask in Scope's UI (black strip at bottom = preserve region).
         frames_01 = frames_stamped / 255.0  # (F, H, W, C), [0, 1]
 
         result = {"video": frames_01}
+
+        # --- 3. Generate VACE mask ---
+        # Scope broadcasts all pipeline params (height, width, input_size) to
+        # every pipeline in the chain, so we read generation dims from kwargs.
+        # If not provided, fall back to input dims aligned to VAE block size.
+        gen_h = int(kwargs.get("height", self._align(H, self._VAE_ALIGN)))
+        gen_w = int(kwargs.get("width", self._align(W, self._VAE_ALIGN)))
+        gen_frames = int(kwargs.get("input_size", F))
+
+        # Ensure alignment even if Scope passes non-aligned values
+        gen_h = self._align(gen_h, self._VAE_ALIGN)
+        gen_w = self._align(gen_w, self._VAE_ALIGN)
+
+        # Scale barcode height proportionally to generation resolution
+        scale_y = gen_h / H if H > 0 else 1.0
+        barcode_h_gen = max(4, round(barcode_h * scale_y))
+
+        # mask=1 -> AI generates (content area)
+        # mask=0 -> preserve (barcode strip at bottom)
+        vace_mask = torch.ones(gen_frames, gen_h, gen_w, dtype=torch.float32)
+        vace_mask[:, -barcode_h_gen:, :] = 0.0  # Preserve barcode strip
+
+        # Reshape to [B=1, C=1, F, H, W] as expected by VaceEncodingBlock
+        vace_mask = vace_mask.unsqueeze(0).unsqueeze(0)  # (1, 1, gen_frames, gen_h, gen_w)
+        vace_mask = vace_mask.to(device=self.device, dtype=self.dtype)
+
+        result["vace_input_masks"] = vace_mask
+
+        if self._frame_seq <= F * 3:
+            logger.info(
+                f"[BPM Buffer] Input {F}×{H}×{W} → VACE mask "
+                f"[1,1,{gen_frames},{gen_h},{gen_w}], "
+                f"barcode={barcode_h}px→{barcode_h_gen}px"
+            )
 
         # Clock state for diagnostics
         result["_bpm_buffer_meta"] = self._clock.source_info
@@ -762,17 +775,6 @@ if _HAS_SCOPE:
             ),
         )
 
-        barcode_height: int = Field(
-            default=16,
-            ge=4,
-            le=128,
-            json_schema_extra=ui_field_config(
-                order=9,
-                label="Barcode Height (px)",
-                is_load_param=True,
-            ),
-        )
-
         buffer_fill_pct: float = Field(
             default=0.0,
             ge=0.0,
@@ -797,7 +799,6 @@ else:
             self.clock_bpm = kwargs.get("clock_bpm", 120.0)
             self.midi_device = kwargs.get("midi_device", "")
             self.osc_beat = kwargs.get("osc_beat", 0.0)
-            self.barcode_height = kwargs.get("barcode_height", 16)
             self.buffer_fill_pct = kwargs.get("buffer_fill_pct", 0.0)
 
 
@@ -967,7 +968,7 @@ class BpmTimecodeStripPipeline(Pipeline):
             return {"video": torch.zeros(1, 1, 1, 3)}
 
         # Read params from kwargs first (Scope runtime updates), fall back to config
-        barcode_h = kwargs.get("barcode_height", getattr(self.config, "barcode_height", 16))
+        barcode_h = STRIP_HEIGHT  # Fixed by codec spec
         mode = str(kwargs.get("buffer_mode", getattr(self.config, "buffer_mode", "latency")))
         latency_ms = kwargs.get("latency_delay_ms", getattr(self.config, "latency_delay_ms", 100))
         beat_depth = kwargs.get("beat_buffer_depth", getattr(self.config, "beat_buffer_depth", 4))
@@ -1035,7 +1036,6 @@ class BpmTimecodeStripPipeline(Pipeline):
             frames = frames * 255.0
 
         F, H, W, C = frames.shape
-        barcode_h = min(barcode_h, H // 4)
         now = time.monotonic()
 
         # --- Decode barcodes and build buffered frames ---

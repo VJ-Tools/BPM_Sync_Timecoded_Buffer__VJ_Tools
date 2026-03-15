@@ -40,43 +40,61 @@ def test_basic_output():
     pipeline = BpmTimecodedBufferPipeline(config)
 
     frame = make_test_frame()
-    result = pipeline(video=[frame], barcode_height=16)
+    result = pipeline(video=[frame])
 
     assert "video" in result
-    # Preprocessor does NOT output vace_input_masks or vace_input_frames
-    # (shape mismatch: preprocessor runs at input resolution but VACE expects
-    # generation resolution + frame count). Barcode survives via BCH ECC.
-    assert "vace_input_masks" not in result, "vace_input_masks must NOT be in result"
-    assert "vace_input_frames" not in result, "vace_input_frames must NOT be in result"
-
     video = _stack_video(result["video"])
-
     assert video.shape == (1, 336, 576, 3), f"Video shape wrong: {video.shape}"
 
     # Video is float [0, 1]
     assert video.max() <= 1.0
     assert video.min() >= 0.0
 
+    # VACE mask is always generated (falls back to input dims aligned to VAE)
+    assert "vace_input_masks" in result, "VACE mask should always be present"
+    # 336 and 576 are already divisible by 8
+    vace_masks = result["vace_input_masks"]
+    assert vace_masks.shape == (1, 1, 1, 336, 576), f"VACE mask shape wrong: {vace_masks.shape}"
+
     print("  [OK] Basic output test passed")
 
 
-def test_no_vace_in_output():
-    """Test that preprocessor does NOT include VACE params (prevents shape mismatch)."""
+def test_vace_mask_at_generation_resolution():
+    """Test VACE mask is generated at the main pipeline's generation resolution."""
     from bpm_sync_timecoded_buffer.pipeline import BpmTimecodedBufferPipeline, BpmBufferConfig
 
     config = BpmBufferConfig()
     pipeline = BpmTimecodedBufferPipeline(config)
 
     frame = make_test_frame()
-    result = pipeline(video=[frame], barcode_height=16)
+    # Simulate Scope broadcasting main pipeline's generation dims
+    result = pipeline(
+        video=[frame],
+        height=320, width=576, input_size=13,
+    )
 
     assert "video" in result
-    # Neither VACE key should be present — they cause shape mismatches
-    # with the main pipeline (e.g. LongLive expects [B,1,13,H,W])
-    assert "vace_input_masks" not in result, "vace_input_masks must NOT be in result"
-    assert "vace_input_frames" not in result, "vace_input_frames must NOT be in result"
+    assert "vace_input_masks" in result, "VACE mask should be present when gen dims available"
+    # vace_input_frames must NOT be present (blocks passthrough)
+    assert "vace_input_frames" not in result
 
-    print("  [OK] No VACE in output test passed")
+    vace_masks = result["vace_input_masks"]
+    # Must match generation resolution (aligned to 8): [B=1, C=1, F=13, H=320, W=576]
+    assert vace_masks.shape == (1, 1, 13, 320, 576), f"VACE mask shape wrong: {vace_masks.shape}"
+
+    # Barcode region (bottom) should be 0 (preserve)
+    # barcode_h is 16px at input 336px, scaled to gen 320px
+    from bpm_sync_timecoded_buffer.vjsync_codec import STRIP_HEIGHT
+    scale_y = 320 / 336
+    barcode_h_gen = max(4, round(STRIP_HEIGHT * scale_y))
+    barcode_mask = vace_masks[0, 0, 0, -barcode_h_gen:, :]
+    assert barcode_mask.max() == 0.0, f"Barcode region should be 0 (preserve), got max={barcode_mask.max()}"
+
+    # Content region should be 1 (generate)
+    content_mask = vace_masks[0, 0, 0, 0, 0]
+    assert content_mask == 1.0, f"Content region should be 1.0, got {content_mask}"
+
+    print("  [OK] VACE mask at generation resolution test passed")
 
 
 def test_barcode_in_video_output():
@@ -86,12 +104,11 @@ def test_barcode_in_video_output():
     config = BpmBufferConfig()
     pipeline = BpmTimecodedBufferPipeline(config)
 
-    barcode_h = 16
-    frame = make_test_frame(barcode_height=barcode_h)
-    result = pipeline(video=[frame], barcode_height=barcode_h)
+    frame = make_test_frame()
+    result = pipeline(video=[frame])
 
     video = _stack_video(result["video"])
-    barcode_region = video[0, -barcode_h:, :, :]
+    barcode_region = video[0, -16:, :, :]
     barcode_uint8 = (barcode_region * 255.0).cpu().numpy().astype(np.uint8)
     unique_vals = np.unique(barcode_uint8)
     assert len(unique_vals) >= 2, f"Video output should have barcode data, got: {unique_vals}"
@@ -107,7 +124,7 @@ def test_multi_frame():
     pipeline = BpmTimecodedBufferPipeline(config)
 
     frames = [make_test_frame() for _ in range(4)]
-    result = pipeline(video=frames, barcode_height=16)
+    result = pipeline(video=frames)
 
     video = _stack_video(result["video"])
     assert video.shape[0] == 4
@@ -123,7 +140,7 @@ def test_test_pattern_input():
     pipeline = BpmTimecodedBufferPipeline(config)
 
     frame = make_test_frame()
-    result = pipeline(video=[frame], barcode_height=16, test_input=True)
+    result = pipeline(video=[frame], test_input=True)
 
     assert "video" in result
 
@@ -301,7 +318,7 @@ if __name__ == "__main__":
 
     tests = [
         test_basic_output,
-        test_no_vace_in_output,
+        test_vace_mask_at_generation_resolution,
         test_barcode_in_video_output,
         test_multi_frame,
         test_test_pattern_input,
