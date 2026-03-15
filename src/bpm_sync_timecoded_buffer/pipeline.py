@@ -525,11 +525,16 @@ class BpmTimecodedBufferPipeline(Pipeline):
             self._test_source.set_bpm(bpm)
         logger.info(f"[BPM Buffer] Manual BPM: {bpm:.1f}")
 
-    # Wan2.1 default: num_frame_per_block(3) × vae_temporal_downsample(4) = 12
-    _DEFAULT_CHUNK_SIZE = 12
+    # Wan2.1: num_frame_per_block(3) × vae_temporal_downsample(4) = 12, +1 for VAE overlap
+    _DEFAULT_CHUNK_SIZE = 13
 
     def prepare(self, **kwargs) -> "Requirements":
-        """Request same chunk size as main pipeline for VACE tensor alignment."""
+        """Request same chunk size as main pipeline for VACE tensor alignment.
+
+        The main pipeline's PreprocessVideoBlock adds +1 frame on the first chunk
+        (current_start_frame == 0) for VAE temporal alignment. We always request 13
+        so our VACE tensors match what VaceEncodingBlock expects.
+        """
         return Requirements(input_size=self._DEFAULT_CHUNK_SIZE)
 
     # VAE alignment — diffusion models require spatial dims divisible by this
