@@ -50,15 +50,17 @@ def test_basic_output():
     assert video.max() <= 1.0
     assert video.min() >= 0.0
 
-    # VACE mask matches input frame count (1 frame in this test)
-    assert "vace_input_masks" in result, "VACE mask should always be present"
-    assert result["vace_input_masks"].shape[2] == 1, "VACE frames should match input"
+    # VACE: both frames and mask present, matching input frame count
+    assert "vace_input_frames" in result, "vace_input_frames should be present"
+    assert "vace_input_masks" in result, "vace_input_masks should be present"
+    assert result["vace_input_frames"].shape[2] == 1, "VACE frames dim should match input"
+    assert result["vace_input_masks"].shape[2] == 1, "VACE mask dim should match input"
 
     print("  [OK] Basic output test passed")
 
 
-def test_vace_mask_at_generation_resolution():
-    """Test VACE mask is generated at the main pipeline's generation resolution."""
+def test_vace_at_generation_resolution():
+    """Test VACE frames+mask at target generation resolution."""
     from bpm_sync_timecoded_buffer.pipeline import BpmTimecodedBufferPipeline, BpmBufferConfig
 
     config = BpmBufferConfig()
@@ -68,20 +70,24 @@ def test_vace_mask_at_generation_resolution():
     # Simulate Scope broadcasting main pipeline's generation dims
     result = pipeline(
         video=[frame],
-        height=320, width=576, input_size=13,
+        height=320, width=576,
     )
 
     assert "video" in result
-    assert "vace_input_masks" in result, "VACE mask should be present when gen dims available"
-    # vace_input_frames must NOT be present (blocks passthrough)
-    assert "vace_input_frames" not in result
+    assert "vace_input_frames" in result, "vace_input_frames should be present"
+    assert "vace_input_masks" in result, "vace_input_masks should be present"
 
+    vace_frames = result["vace_input_frames"]
     vace_masks = result["vace_input_masks"]
-    # Must match generation resolution (aligned to 8): [B=1, C=1, F=13, H=320, W=576]
-    assert vace_masks.shape == (1, 1, 13, 320, 576), f"VACE mask shape wrong: {vace_masks.shape}"
+
+    # Frames: [1, 3, F=1, H=320, W=576], range [-1, 1]
+    assert vace_frames.shape == (1, 3, 1, 320, 576), f"VACE frames shape wrong: {vace_frames.shape}"
+    assert vace_frames.min() >= -1.0 and vace_frames.max() <= 1.0
+
+    # Mask: [1, 1, F=1, H=320, W=576]
+    assert vace_masks.shape == (1, 1, 1, 320, 576), f"VACE mask shape wrong: {vace_masks.shape}"
 
     # Barcode region (bottom) should be 0 (preserve)
-    # barcode_h is 16px at input 336px, scaled to gen 320px
     from bpm_sync_timecoded_buffer.vjsync_codec import STRIP_HEIGHT
     scale_y = 320 / 336
     barcode_h_gen = max(4, round(STRIP_HEIGHT * scale_y))
@@ -92,7 +98,7 @@ def test_vace_mask_at_generation_resolution():
     content_mask = vace_masks[0, 0, 0, 0, 0]
     assert content_mask == 1.0, f"Content region should be 1.0, got {content_mask}"
 
-    print("  [OK] VACE mask at generation resolution test passed")
+    print("  [OK] VACE at generation resolution test passed")
 
 
 def test_barcode_in_video_output():
@@ -316,7 +322,7 @@ if __name__ == "__main__":
 
     tests = [
         test_basic_output,
-        test_vace_mask_at_generation_resolution,
+        test_vace_at_generation_resolution,
         test_barcode_in_video_output,
         test_multi_frame,
         test_test_pattern_input,
