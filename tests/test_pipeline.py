@@ -50,9 +50,9 @@ def test_basic_output():
     assert video.max() <= 1.0
     assert video.min() >= 0.0
 
-    # Without input_size/num_frames in kwargs, VACE mask is skipped
-    # (preprocessor can't know the main pipeline's frame count)
-    assert "vace_input_masks" not in result, "Without frame count kwarg, no VACE mask"
+    # VACE mask is always generated (defaults to 13-frame Wan2.1 chunk)
+    assert "vace_input_masks" in result, "VACE mask should always be present"
+    assert result["vace_input_masks"].shape[2] == 13, "Default chunk size should be 13"
 
     print("  [OK] Basic output test passed")
 

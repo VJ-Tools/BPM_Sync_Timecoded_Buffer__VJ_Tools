@@ -649,17 +649,20 @@ class BpmTimecodedBufferPipeline(Pipeline):
                     print(f"[BPM Buffer] Found frame count from '{key}' = {gen_frames}", flush=True)
                 break
 
+        # Wan2.1 uses 13-frame chunks. Default to 13 if Scope doesn't
+        # broadcast the frame count — VACE mask MUST match or diffusion
+        # destroys the barcode.
+        _WAN21_CHUNK = 13
         if gen_frames is None or gen_frames < 1:
-            # Cannot determine main pipeline's frame count — skip VACE mask
-            # to avoid shape mismatch. Barcode still survives via BCH error
-            # correction (corrects up to 3 bit errors per codeword).
+            gen_frames = _WAN21_CHUNK
             if self._frame_seq <= F * 3:
                 print(
-                    f"[BPM Buffer] Cannot determine generation frame count from kwargs. "
-                    f"Skipping vace_input_masks. Barcode relies on BCH error correction only.",
+                    f"[BPM Buffer] No frame count in kwargs, defaulting to {_WAN21_CHUNK} "
+                    f"(Wan2.1 chunk size) for VACE mask.",
                     flush=True,
                 )
-        else:
+
+        if gen_frames is not None and gen_frames >= 1:
             # Ensure alignment even if Scope passes non-aligned values
             gen_h = self._align(gen_h, self._VAE_ALIGN)
             gen_w = self._align(gen_w, self._VAE_ALIGN)
