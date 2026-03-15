@@ -647,6 +647,9 @@ class BpmTimecodedBufferPipeline(Pipeline):
         result = {
             "video": frames_01.cpu(),
             "vace_input_frames": vace_frame_list,
+            # Explicitly clear masks — VaceEncodingBlock generates default all-ones.
+            # Without this, stale masks from previous runs persist via update_parameters.
+            "vace_input_masks": None,
         }
 
         # Clock state for diagnostics
