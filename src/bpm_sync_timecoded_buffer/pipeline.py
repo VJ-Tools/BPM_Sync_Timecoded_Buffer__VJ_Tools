@@ -525,16 +525,11 @@ class BpmTimecodedBufferPipeline(Pipeline):
             self._test_source.set_bpm(bpm)
         logger.info(f"[BPM Buffer] Manual BPM: {bpm:.1f}")
 
-    # Wan2.1: num_frame_per_block(3) × vae_temporal_downsample(4) = 12, +1 for VAE overlap
-    _DEFAULT_CHUNK_SIZE = 13
+    # Wan2.1: num_frame_per_block(3) × vae_temporal_downsample(4) = 12
+    _DEFAULT_CHUNK_SIZE = 12
 
     def prepare(self, **kwargs) -> "Requirements":
-        """Request same chunk size as main pipeline for VACE tensor alignment.
-
-        The main pipeline's PreprocessVideoBlock adds +1 frame on the first chunk
-        (current_start_frame == 0) for VAE temporal alignment. We always request 13
-        so our VACE tensors match what VaceEncodingBlock expects.
-        """
+        """Request video frames from Scope's input queue."""
         return Requirements(input_size=self._DEFAULT_CHUNK_SIZE)
 
     # VAE alignment — diffusion models require spatial dims divisible by this
@@ -625,69 +620,34 @@ class BpmTimecodedBufferPipeline(Pipeline):
         # Convert back to tensor with stamped barcodes
         frames_stamped = torch.from_numpy(frames_np).float()
 
-        # --- 2. Build VACE tensors + display output ---
-        # Matches scope-vjsync-node pattern: emit both vace_input_frames and
-        # vace_input_masks at the target generation resolution. Scope forwards
-        # these directly to VaceEncodingBlock — no concatenation.
+        # --- 2. Build output ---
+        # Send vace_input_frames as a LIST of (1, H, W, C) uint8 tensors —
+        # same format as Scope's video input. Scope's PreprocessVideoBlock
+        # handles all resizing, frame-count adjustment (12→13 for first chunk),
+        # and [-1,1] normalization automatically.
+        #
+        # We do NOT send vace_input_masks — VaceEncodingBlock defaults to
+        # all-ones mask (condition on entire frame including barcode).
+        # This avoids the frame-count mismatch since masks can't be auto-resized.
         frames_01 = frames_stamped / 255.0  # (F, H, W, C), [0, 1]
 
-        # Resolve target resolution (Scope broadcasts height/width from main pipeline)
-        target_h = int(kwargs.get("height", self._align(H, self._VAE_ALIGN)))
-        target_w = int(kwargs.get("width", self._align(W, self._VAE_ALIGN)))
-        target_h = self._align(target_h, self._VAE_ALIGN)
-        target_w = self._align(target_w, self._VAE_ALIGN)
-        needs_resize = (target_h != H) or (target_w != W)
+        # vace_input_frames: list of (1, H, W, C) uint8 tensors for preprocess_chunk
+        vace_frame_list = [frames_stamped[i:i+1] for i in range(F)]
 
-        # Scale barcode height proportionally to target resolution
-        scale_y = target_h / H if H > 0 else 1.0
-        barcode_h_target = max(4, round(barcode_h * scale_y))
-
-        # Log kwargs on first few calls for diagnostics
+        # Log on first few calls for diagnostics
         if self._frame_seq <= F * 3:
             kwarg_keys = {k: type(v).__name__ for k, v in kwargs.items() if k != "video"}
             print(
-                f"[BPM Buffer] F={F}, {H}×{W} → target {target_h}×{target_w}, "
-                f"resize={needs_resize}, kwargs={kwarg_keys}",
+                f"[BPM Buffer] F={F}, {H}×{W}, "
+                f"vace_frames={len(vace_frame_list)}×{list(vace_frame_list[0].shape)}, "
+                f"kwargs={kwarg_keys}",
                 flush=True,
             )
-
-        # --- VACE input frames: [1, 3, F, H, W] in [-1, 1] ---
-        if needs_resize:
-            frames_resized = frames_01.permute(0, 3, 1, 2)  # (F, C, H, W)
-            frames_resized = torch.nn.functional.interpolate(
-                frames_resized,
-                size=(target_h, target_w),
-                mode="bilinear",
-                align_corners=False,
-            )  # (F, C, target_h, target_w)
-            vace_frames = (frames_resized * 2.0 - 1.0).permute(1, 0, 2, 3).unsqueeze(0)
-        else:
-            vace_frames = (frames_01 * 2.0 - 1.0).permute(3, 0, 1, 2).unsqueeze(0)
-        # -> (1, C=3, F, target_h, target_w), [-1, 1]
-        vace_frames = vace_frames.to(device=self.device, dtype=self.dtype)
-
-        # --- VACE mask: [1, 1, F, H, W] binary ---
-        # mask=1 -> AI generates (content), mask=0 -> preserve (barcode strip)
-        vace_mask = torch.ones(F, target_h, target_w, dtype=torch.float32)
-        vace_mask[:, -barcode_h_target:, :] = 0.0  # Preserve barcode strip
-        vace_mask = vace_mask.unsqueeze(0).unsqueeze(0)  # (1, 1, F, H, W)
-        vace_mask = vace_mask.to(device=self.device, dtype=self.dtype)
-
-        # --- Display output (original resolution, [0, 1]) ---
-        display = frames_01.clone()
 
         result = {
-            "video": display.cpu(),
-            "vace_input_frames": vace_frames,
-            "vace_input_masks": vace_mask,
+            "video": frames_01.cpu(),
+            "vace_input_frames": vace_frame_list,
         }
-
-        if self._frame_seq <= F * 3:
-            print(
-                f"[BPM Buffer] VACE: frames={list(vace_frames.shape)}, "
-                f"mask={list(vace_mask.shape)}, barcode={barcode_h}→{barcode_h_target}px",
-                flush=True,
-            )
 
         # Clock state for diagnostics
         result["_bpm_buffer_meta"] = self._clock.source_info
