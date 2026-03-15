@@ -628,9 +628,10 @@ class BpmTimecodedBufferPipeline(Pipeline):
         # VaceEncodingBlock expectations.
         #
         # Log all kwargs on first few calls so we can diagnose param names.
+        # Use print() to bypass Scope's log-level filtering.
         if self._frame_seq <= F * 3:
             kwarg_keys = {k: type(v).__name__ for k, v in kwargs.items() if k != "video"}
-            logger.info(f"[BPM Buffer] kwargs keys: {kwarg_keys}")
+            print(f"[BPM Buffer] kwargs keys: {kwarg_keys}", flush=True)
 
         gen_h = int(kwargs.get("height", self._align(H, self._VAE_ALIGN)))
         gen_w = int(kwargs.get("width", self._align(W, self._VAE_ALIGN)))
@@ -645,7 +646,7 @@ class BpmTimecodedBufferPipeline(Pipeline):
             if val is not None:
                 gen_frames = int(val)
                 if self._frame_seq <= F * 3:
-                    logger.info(f"[BPM Buffer] Found frame count from '{key}' = {gen_frames}")
+                    print(f"[BPM Buffer] Found frame count from '{key}' = {gen_frames}", flush=True)
                 break
 
         if gen_frames is None or gen_frames < 1:
@@ -653,9 +654,10 @@ class BpmTimecodedBufferPipeline(Pipeline):
             # to avoid shape mismatch. Barcode still survives via BCH error
             # correction (corrects up to 3 bit errors per codeword).
             if self._frame_seq <= F * 3:
-                logger.warning(
+                print(
                     f"[BPM Buffer] Cannot determine generation frame count from kwargs. "
-                    f"Skipping vace_input_masks. Barcode relies on BCH error correction only."
+                    f"Skipping vace_input_masks. Barcode relies on BCH error correction only.",
+                    flush=True,
                 )
         else:
             # Ensure alignment even if Scope passes non-aligned values
